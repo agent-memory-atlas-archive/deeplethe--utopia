@@ -145,7 +145,7 @@ export function SchedulePicker({
     const t = v.time ?? time;
     const [hh, mm] = t.split(":").map(Number);
     // 时间格式未成形时（手输中途）不更新日程，保留上一个有效值
-    if ((m === "daily" || m === "weekly") && (Number.isNaN(hh) || Number.isNaN(mm))) return;
+    if ((m === "daily" || m === "weekly") && !/^([01]?\d|2[0-3]):[0-5]\d$/.test(t)) return;
     switch (m) {
       case "manual":
         return onChange({ sync_interval_minutes: null, sync_cron: null });
