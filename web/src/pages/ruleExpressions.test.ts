@@ -34,6 +34,28 @@ describe("reading existing rule expressions", () => {
     expect(readExpression(tree)).not.toBeNull();
     expect(readExpression({ op: "add", l: tree, r: { const: 1 } })).toBeNull();
   });
+  it("renders conversions and quoted labels without losing their structure", () => {
+    const cast = { op: "div", l: { cast: "number", expr: { attr: a } }, r: { const: 100 } };
+    const choice = { case: { attr: b }, when: [{ is: 1, then: "用户's app" }, { is: 2, then: "web" }], else: "other" };
+    const date = { date_trunc: "month", expr: { attr: a } };
+    for (const raw of [cast, choice, date, { text: "NaN is a label" }]) expect(readExpression(raw)).toEqual(raw);
+    expect(expressionText(cast, attrs, "unknown")).toBe("(CAST(收入 AS DOUBLE PRECISION) ÷ 100)");
+    expect(expressionText(choice, attrs, "unknown")).toBe("CASE 成本 WHEN 1 THEN '用户''s app' WHEN 2 THEN 'web' ELSE 'other' END");
+    expect(expressionText(date, attrs.map((attr) => ({ ...attr, label: attr.key })), "unknown")).toBe("DATE_TRUNC('month', revenue)");
+  });
+  it("keeps malformed and future conversion shapes unknown", () => {
+    for (const raw of [
+      { cast: "integer", expr: { attr: a } }, { cast: "number", expr: { attr: a }, future: true },
+      { date_trunc: "hour", expr: { attr: a } }, { case: { attr: a }, when: [] },
+      { case: { attr: a }, when: [{ is: 1, then: "app" }], else: 0 },
+      { case: { attr: a }, when: [{ is: 1, then: { attr: b } }] },
+      { case: { attr: a }, when: Array.from({ length: 33 }, (_, i) => ({ is: i, then: "app" })) },
+    ]) expect(readExpression(raw)).toBeNull();
+    let deep: unknown = { attr: a };
+    for (let i = 0; i < 4; i++) deep = { cast: "number", expr: deep };
+    expect(readExpression(deep)).not.toBeNull();
+    expect(readExpression({ date_trunc: "month", expr: deep })).toBeNull();
+  });
   it("guards definitions the constant form cannot round-trip", () => {
     expect(metadataOnly(rule)).toBe(true);
     expect(metadataOnly({ ...rule, conclusion: "typing", conditions: [{ predicate_id: a, op: "gt", operand: expr }] })).toBe(true);

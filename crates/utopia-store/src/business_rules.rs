@@ -303,6 +303,27 @@ pub async fn update(
             .await?;
         insert_conditions(&mut tx, rule_id, cs).await?;
     }
+    if conditions.is_some() || conclusion.is_some() {
+        // 在持有规则行锁的事务内校验最终条件，保留条件和并发更新都不能绕过。
+        let reads_y_without_join: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM attribute_rules r
+                 JOIN attribute_rule_conditions c ON c.rule_id = r.id
+                 WHERE r.kb_id = $1 AND r.id = $2
+                   AND r.join_predicate_id IS NULL AND c.subject_side = 'y'
+             )",
+        )
+        .bind(kb_id)
+        .bind(rule_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if reads_y_without_join {
+            return Err(AppError::invalid(
+                "condition_side_without_join",
+                "Only a joined rule can read the other side of an edge.",
+            ));
+        }
+    }
     // 定义变了才开新版本；改名、改描述、开关不算（0060）
     record_version(&mut tx, kb_id, rule_id).await?;
     tx.commit().await?;
@@ -573,10 +594,7 @@ pub async fn describe_expressions(
     kb_id: Uuid,
     expressions: &[&serde_json::Value],
 ) -> AppResult<Vec<Option<String>>> {
-    let reads: Vec<_> = expressions
-        .iter()
-        .map(|e| validate_expr(e, 0).ok())
-        .collect();
+    let reads: Vec<_> = expressions.iter().map(|e| validate_expr(e).ok()).collect();
     let mut ids: Vec<Uuid> = reads.iter().flatten().flatten().copied().collect();
     ids.sort();
     ids.dedup();
@@ -830,7 +848,7 @@ async fn validate_conclusion(pool: &PgPool, kb_id: Uuid, c: &ConclusionInput) ->
             // **这几条挡在入口而不是留给求值器。** 读不懂的树在求值时只会
             // 「这条规则什么都不推」，而写它的人看不见任何理由（`not_in`
             // 那次就是这么丢的，见 #494）
-            let reads = validate_expr(expr, 0)?;
+            let reads = validate_expr(expr)?;
             if reads.is_empty() {
                 return Err(AppError::invalid(
                     "constant_expression",
@@ -866,40 +884,11 @@ async fn validate_conclusion(pool: &PgPool, kb_id: Uuid, c: &ConclusionInput) ->
 /// **形状不对就说清哪里不对。** 库里的 CHECK 只管「computed 得有一棵树」，
 /// 树自己长得对不对得在这里判——否则一棵写坏的树要等到下一次物化才表现为
 /// 「这条规则不推东西」，而那时候没有任何地方说得出为什么。
-fn validate_expr(raw: &serde_json::Value, depth: usize) -> AppResult<Vec<Uuid>> {
-    use utopia_reason::rules::{Arith, MAX_EXPR_DEPTH};
-    if depth > MAX_EXPR_DEPTH {
-        return Err(AppError::invalid(
-            "expression_too_deep",
-            "That expression nests too deeply; a rule computes with a few operations, not a program.",
-        ));
-    }
-    let bad = || {
-        AppError::invalid(
-            "bad_expression",
-            "An expression is an attribute, a number, or two of those combined with + − × ÷.",
-        )
-    };
-    let obj = raw.as_object().ok_or_else(bad)?;
-    if let Some(a) = obj.get("attr") {
-        let id: Uuid = a.as_str().ok_or_else(bad)?.parse().map_err(|_| bad())?;
-        return Ok(vec![id]);
-    }
-    if let Some(c) = obj.get("const") {
-        let n = c
-            .as_f64()
-            .or_else(|| c.as_str()?.trim().parse().ok())
-            .ok_or_else(bad)?;
-        if !n.is_finite() {
-            return Err(bad());
-        }
-        return Ok(Vec::new());
-    }
-    Arith::parse(obj.get("op").and_then(|v| v.as_str()).ok_or_else(bad)?).ok_or_else(bad)?;
-    let mut reads = validate_expr(obj.get("l").ok_or_else(bad)?, depth + 1)?;
-    reads.extend(validate_expr(obj.get("r").ok_or_else(bad)?, depth + 1)?);
-    reads.sort();
-    reads.dedup();
+fn validate_expr(raw: &serde_json::Value) -> AppResult<Vec<Uuid>> {
+    let expr = utopia_reason::rules::Expr::from_json(raw)
+        .map_err(|e| AppError::invalid(e.code(), e.message()))?;
+    let mut reads = Vec::new();
+    expr.predicates(&mut reads);
     Ok(reads)
 }
 
@@ -941,7 +930,7 @@ async fn validate_conditions(
                 | utopia_reason::rules::Op::Lte
         ) {
             if let Some(expr) = c.operand.as_ref().filter(|v| v.is_object()) {
-                for predicate in validate_expr(expr, 0)? {
+                for predicate in validate_expr(expr)? {
                     attribute_predicate(pool, kb_id, predicate).await?;
                 }
                 continue;

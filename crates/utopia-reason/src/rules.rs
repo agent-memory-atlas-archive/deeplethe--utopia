@@ -10,6 +10,7 @@
 //! 这一层同样不碰数据库。取规则、取属性事实、落库都在 `utopia-store`。
 
 use crate::derive::validity;
+pub use crate::expressions::{Expr, Scalar, MAX_EXPR_DEPTH};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -145,75 +146,21 @@ impl Arith {
     }
 }
 
-/// 一个数是怎么算出来的（0032）。叶子要么是这个实体的一条属性读数，要么是
-/// 写死的数；中间是四则。
-///
-/// **树，不是字符串。** 存下来的就是这棵树，界面照着它渲染，求值照着它算——
-/// 两者不会漂移，而这正是 0002 拒掉「用户自定义规则语言」时真正在守的东西。
-#[derive(Debug, Clone, PartialEq)]
-pub enum Expr {
-    /// 这个实体在这个谓词上的读数
-    Attr(Uuid),
-    Const(f64),
-    Arith {
-        op: Arith,
-        l: Box<Expr>,
-        r: Box<Expr>,
-    },
-}
-
-/// 一棵算式最深几层。太深的树是「有人在这里写程序」的信号，编译时就该拦下
-pub const MAX_EXPR_DEPTH: usize = 4;
-
 impl Expr {
-    /// 这棵树读了哪些谓词，按出现顺序、去重。求值前要为它们各留一个槽位
-    pub fn predicates(&self, out: &mut Vec<Uuid>) {
-        match self {
-            Expr::Attr(p) => {
-                if !out.contains(p) {
-                    out.push(*p);
-                }
-            }
-            Expr::Const(_) => {}
-            Expr::Arith { l, r, .. } => {
-                l.predicates(out);
-                r.predicates(out);
-            }
-        }
-    }
-
-    pub fn depth(&self) -> usize {
-        match self {
-            Expr::Attr(_) | Expr::Const(_) => 1,
-            Expr::Arith { l, r, .. } => 1 + l.depth().max(r.depth()),
-        }
-    }
-
-    /// 按这一轮选中的读数算一个数。
-    ///
-    /// **算不出来就是 None，不是 0**：读数不在（没记 ≠ 零）、值不是数、除零，
-    /// 三种情况一律没有值，于是这条规则在这个组合上不出结论（0032）。把它们
-    /// 当零，等于在无知的地方填一个确定的答案。
+    /// Comparisons still need a number, including the legacy numeric-string readings.
     pub fn eval(&self, bound: &HashMap<Uuid, &AttrFact>) -> Option<f64> {
-        Some(match self {
-            Expr::Attr(p) => num(&bound.get(p)?.value)?,
-            Expr::Const(n) => *n,
-            Expr::Arith { op, l, r } => {
-                let (a, b) = (l.eval(bound)?, r.eval(bound)?);
-                match op {
-                    Arith::Add => a + b,
-                    Arith::Sub => a - b,
-                    Arith::Mul => a * b,
-                    Arith::Div => {
-                        if b == 0.0 {
-                            return None;
-                        }
-                        a / b
-                    }
-                }
-            }
-        })
-        .filter(|n: &f64| n.is_finite())
+        self.compute(bound)?.number()
+    }
+
+    fn compute(&self, bound: &HashMap<Uuid, &AttrFact>) -> Option<Scalar> {
+        let value = self.evaluate(&|id| Scalar::read(&bound.get(&id)?.value))?;
+        // An old bare-attribute expression meant a numeric reading. CASE and
+        // date truncation introduce text results explicitly, without changing it.
+        if matches!(self, Self::Attr(_)) {
+            value.number().map(Scalar::Number)
+        } else {
+            Some(value)
+        }
     }
 }
 
@@ -267,9 +214,9 @@ pub struct RuleHit {
     pub premises: Vec<Uuid>,
     pub from: Option<i64>,
     pub to: Option<i64>,
-    /// 算出来的结论值（0032）。**每个组合各算各的**——两条 revenue 三条 cost
-    /// 就是六个数、六段区间、六行结论；常量结论这里是 None
-    pub value: Option<f64>,
+    /// Each combination has its own scalar result and interval. A conversion
+    /// can also produce text or an ISO calendar date; constant conclusions use None.
+    pub value: Option<Scalar>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -360,7 +307,7 @@ pub fn evaluate_with_pool(
             // 同一实体上，一条规则的多个组可能推出同一段区间。去重跨组，
             // 因为它们落成的是同一行派生事实
             // 去重的键带上算出来的值（0032）：同一区间上两个不同的值是两行
-            let mut seen: Vec<(Option<i64>, Option<i64>, Option<u64>)> = Vec::new();
+            let mut seen: Vec<(Option<i64>, Option<i64>, Option<Scalar>)> = Vec::new();
             // 这条规则在这个实体上有没有哪一组因组合太多没展开完。**按 (规则, 实体)
             // 记一次**：报出来的是「这里少推了东西」，不是「少推了几组」
             let mut capped_here = false;
@@ -435,10 +382,10 @@ pub fn evaluate_with_pool(
                     if !holds {
                         continue;
                     }
-                    // 算出来的结论：这个组合上算不出数就不出结论（缺读数、
-                    // 不是数、除零），而不是落一行没有值的派生
+                    // Missing readings and failed conversions do not manufacture
+                    // a value. The same premises and interval cover text results.
                     let value = match &rule.conclusion {
-                        Conclusion::Computed { expr, .. } => match expr.eval(&bound) {
+                        Conclusion::Computed { expr, .. } => match expr.compute(&bound) {
                             Some(v) => Some(v),
                             None => continue,
                         },
@@ -449,8 +396,18 @@ pub fn evaluate_with_pool(
                     };
                     // 去重按 (区间, 值)：算出来的结论同一区间可以有不同的值，
                     // 那是两行，不是一行
-                    let key = (from, to, value.map(f64::to_bits));
-                    if seen.contains(&key) {
+                    let key = (from, to, value.clone());
+                    // Keep the old numeric bit key while admitting text results.
+                    if seen.iter().any(|(old_from, old_to, old_value)| {
+                        *old_from == from
+                            && *old_to == to
+                            && match (old_value, &value) {
+                                (Some(Scalar::Number(a)), Some(Scalar::Number(b))) => {
+                                    a.to_bits() == b.to_bits()
+                                }
+                                _ => old_value == &value,
+                            }
+                    }) {
                         continue;
                     }
                     seen.push(key);
@@ -639,17 +596,12 @@ fn joined_evaluate(
 }
 
 fn expr_predicates(expr: &Expr, side: Side, out: &mut Vec<(Side, Uuid)>) {
-    match expr {
-        Expr::Attr(predicate) => {
-            let slot = (side, *predicate);
-            if !out.contains(&slot) {
-                out.push(slot);
-            }
-        }
-        Expr::Const(_) => {}
-        Expr::Arith { l, r, .. } => {
-            expr_predicates(l, side, out);
-            expr_predicates(r, side, out);
+    let mut predicates = Vec::new();
+    expr.predicates(&mut predicates);
+    for predicate in predicates {
+        let slot = (side, predicate);
+        if !out.contains(&slot) {
+            out.push(slot);
         }
     }
 }
@@ -1291,7 +1243,7 @@ mod tests {
         let spans = HashMap::from([(id(1), (Some(100), None)), (id(2), (Some(100), None))]);
         let (hits, _) = evaluate(&[rule], &facts, &spans, &[]);
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].value, Some(180.0));
+        assert_eq!(hits[0].value, Some(Scalar::Number(180.0)));
         // 条件只提到 revenue，可 cost 也读了——它照样是前提
         assert_eq!(hits[0].premises.len(), 2);
         assert!(hits[0].premises.contains(&id(1)) && hits[0].premises.contains(&id(2)));
@@ -1328,7 +1280,10 @@ mod tests {
         ]);
         let (hits, _) = evaluate(&[rule], &facts, &spans, &[]);
         assert_eq!(hits.len(), 2, "两条 revenue 各算一个 margin");
-        let mut values: Vec<f64> = hits.iter().filter_map(|h| h.value).collect();
+        let mut values: Vec<f64> = hits
+            .iter()
+            .filter_map(|h| h.value.as_ref()?.number())
+            .collect();
         values.sort_by(f64::total_cmp);
         assert_eq!(values, vec![180.0, 280.0]);
     }

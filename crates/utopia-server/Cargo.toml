@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 utopia-core.workspace = true
 utopia-store.workspace = true
+utopia-reason.workspace = true
 utopia-ingest.workspace = true
 utopia-search.workspace = true
 utopia-llm.workspace = true

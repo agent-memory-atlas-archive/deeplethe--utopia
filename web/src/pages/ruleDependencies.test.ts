@@ -29,6 +29,17 @@ describe("potential definition dependencies", () => {
     expect([...links.get("computed")!.producers]).toEqual(["p", "q"]);
     expect([...links.get("operand")!.producers]).toEqual(["p", "q"]);
   });
+  it("follows conversion inputs without treating case labels as attribute references", () => {
+    const expr = { op: "div", l: { cast: "number", expr: { attr: "amount" } }, r: { case: { attr: "unit" }, when: [{ is: "cents", then: "label-only" }] } };
+    const converted = r("converted", { conclusion: "computed", conclude_expr: expr });
+    const dated = r("dated", { conclusion: "computed", conclude_expr: { date_trunc: "month", expr: { attr: "date" } } });
+    const producers = ["amount", "unit", "date", "label-only"].map((p) => r(p, { conclude_predicate_id: p }));
+    const { links, incomplete } = ruleDependencies([...producers, converted, dated], classes);
+    expect([...links.get("converted")!.producers]).toEqual(["amount", "unit"]);
+    expect([...links.get("dated")!.producers]).toEqual(["date"]);
+    expect(links.get("label-only")!.consumers.size).toBe(0);
+    expect(incomplete).toBe(false);
+  });
   it("matches concluded subclasses to ancestor scopes, not the reverse", () => {
     const { links } = ruleDependencies([r("child-output", { conclusion: "typing", conclude_type_id: "child" }), r("root-output", { conclusion: "typing", conclude_type_id: "root" }), r("child-scope", { subject_type_id: "child" }), r("leaf-scope", { subject_type_id: "leaf" })], classes);
     expect(links.get("child-output")!.consumers.has("child-scope")).toBe(true);

@@ -317,16 +317,21 @@ async fn agent(pool: &PgPool, kb_id: Uuid) -> AppResult<ReviewAgent> {
 
 async fn health(pool: &PgPool, kb_id: Uuid) -> AppResult<ReviewHealth> {
     // 只数在世的事实（invalidated_at IS NULL）：作废的不算库的成色。
-    // 「有争议」= 挂在一条还开着的冲突的任一端
+    // 「有争议」= 挂在一条还开着的冲突的任一端。先合并两端，避免每条事实
+    // 再探测一次冲突表；UNION 去重，同一事实挂在几条冲突上也只计一次。
     let sql = format!(
         "SELECT count(*) AS facts,
                 count(*) FILTER (WHERE f.confidence < $2 AND f.derived_by_rule IS NULL) AS low_confidence,
                 count(*) FILTER (WHERE {unconfirmed}) AS unconfirmed,
-                count(*) FILTER (WHERE EXISTS (
-                    SELECT 1 FROM fact_conflicts c
-                     WHERE c.status = 'open'
-                       AND (c.old_fact_id = f.id OR c.new_fact_id = f.id))) AS contested
+                count(c.fact_id) AS contested
            FROM facts f
+           LEFT JOIN (
+               SELECT old_fact_id AS fact_id FROM fact_conflicts
+                WHERE kb_id = $1 AND status = 'open'
+               UNION
+               SELECT new_fact_id AS fact_id FROM fact_conflicts
+                WHERE kb_id = $1 AND status = 'open'
+           ) c ON c.fact_id = f.id
           WHERE f.kb_id = $1 AND f.invalidated_at IS NULL",
         unconfirmed = UNCONFIRMED_FACT,
     );

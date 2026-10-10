@@ -41,8 +41,9 @@ function Lab({ kbId }: { kbId: string }) {
       <SearchSelect value={source} options={candidates} placeholder={S.expressionDraft.choose} onChange={(id) => {
         const raw = candidates.find((c) => c.value === id)?.raw;
         const expr = readExpression(raw);
-        setSource(id); setUnsupported(!expr);
-        if (expr) setDraft(draftFromExpression(expr));
+        const nextDraft = expr ? draftFromExpression(expr) : null;
+        setSource(id); setUnsupported(!nextDraft);
+        if (nextDraft) setDraft(nextDraft);
       }} />
     </Field>
     {unsupported ? <p role="alert" className="text-small text-warn">{S.expressionDraft.unsupported}</p> : <>

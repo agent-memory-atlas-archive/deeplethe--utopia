@@ -78,9 +78,16 @@ pub async fn create(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     Path(kb_id): Path<Uuid>,
-    Json(req): Json<RuleReq>,
+    Json(mut req): Json<RuleReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Editor).await?;
+    super::rule_expression_input::compile_inputs(
+        &state.pool,
+        kb_id,
+        req.conclude_expr.as_mut(),
+        &mut req.conditions,
+    )
+    .await?;
     let id = utopia_store::business_rules::create(
         &state.pool,
         kb_id,
@@ -113,9 +120,20 @@ pub async fn update(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     Path((kb_id, rule_id)): Path<(Uuid, Uuid)>,
-    Json(req): Json<RulePatch>,
+    Json(mut req): Json<RulePatch>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Editor).await?;
+    super::rule_expression_input::compile_inputs(
+        &state.pool,
+        kb_id,
+        if req.conclusion.is_some() {
+            req.conclude_expr.as_mut()
+        } else {
+            None
+        },
+        req.conditions.as_deref_mut().unwrap_or_default(),
+    )
+    .await?;
     let conclusion = req.conclusion.as_ref().map(|kind| ConclusionInput {
         kind: kind.clone(),
         type_id: req.conclude_type_id,

@@ -137,9 +137,9 @@ async fn axioms(conn: &mut PgConnection, kb_id: Uuid) -> AppResult<HashMap<Uuid,
 
 /// 主语不在谓词声明的 domain 里、或宾语不在 range 里的活事实（#190 / #196）。
 ///
-/// 这是签名检查在**账本层**的那一半：抽取与采纳在写入时按 `ontology::judge_direction`
-/// 掰正或留空，但合并会换掉主语、本体会事后改 domain，写入时的守卫挡不住写入之后
-/// 的改动。所以这里对着库量一遍，任何一条路写反了都在 Review 里看得见。
+/// 签名检查在**账本层**：对齐只给结构对得上的候选（0053），但合并会换掉主语、本体会
+/// 事后改 domain，写入时的把关挡不住写入之后的改动。所以这里对着库量一遍，任何一条路
+/// 写反了都在 Review 里看得见。
 ///
 /// **没有类型的实体不算**：它没有类型可比，「不知道」不是「不符合」——按 0009，
 /// 未分类是一种诚实的状态，不该因此被报成矛盾。声明了 domain / range 的谓词才查，
@@ -1694,7 +1694,7 @@ async fn attribute_rules(conn: &mut PgConnection, kb_id: Uuid) -> AppResult<Load
                 let (Some(p), Some(e)) = (conclude_pred, conclude_expr) else {
                     continue;
                 };
-                let Some(expr) = parse_expr(&e, 0) else {
+                let Ok(expr) = utopia_reason::rules::Expr::from_json(&e) else {
                     continue;
                 };
                 (Conclusion::Computed { predicate: p, expr }, p)
@@ -1746,34 +1746,6 @@ async fn attribute_rules(conn: &mut PgConnection, kb_id: Uuid) -> AppResult<Load
     })
 }
 
-/// 算式的 JSON 形状 → 树（0032）。
-///
-/// `{"attr": "<uuid>"} | {"const": 12.5} | {"op": "sub", "l": {…}, "r": {…}}`
-///
-/// **认不出来返回 None**，调用方整条规则跳过——一棵读不懂的算式算不出数，
-/// 而算不出数的规则不该带着半棵树去求值。深度也在这里拦：太深的树是
-/// 「有人在这里写程序」的信号（0032）。
-fn parse_expr(raw: &serde_json::Value, depth: usize) -> Option<utopia_reason::rules::Expr> {
-    use utopia_reason::rules::{Arith, Expr, MAX_EXPR_DEPTH};
-    if depth > MAX_EXPR_DEPTH {
-        return None;
-    }
-    let obj = raw.as_object()?;
-    if let Some(a) = obj.get("attr") {
-        return Some(Expr::Attr(a.as_str()?.parse().ok()?));
-    }
-    if let Some(c) = obj.get("const") {
-        let n = c.as_f64().or_else(|| c.as_str()?.trim().parse().ok())?;
-        return n.is_finite().then_some(Expr::Const(n));
-    }
-    let op = Arith::parse(obj.get("op")?.as_str()?)?;
-    Some(Expr::Arith {
-        op,
-        l: Box::new(parse_expr(obj.get("l")?, depth + 1)?),
-        r: Box::new(parse_expr(obj.get("r")?, depth + 1)?),
-    })
-}
-
 /// 操作数按 op 解析。形状不对返回 None，调用方整条规则跳过。
 fn parse_operand(
     op: utopia_reason::rules::Op,
@@ -1807,7 +1779,9 @@ fn parse_operand(
         _ => {
             let raw = raw?;
             if raw.is_object() {
-                return parse_expr(raw, 0).map(Operand::Calc);
+                return utopia_reason::rules::Expr::from_json(raw)
+                    .ok()
+                    .map(Operand::Calc);
             }
             Some(Operand::Num(raw.as_f64().or_else(|| {
                 raw.as_str().and_then(|s| s.trim().parse().ok())
@@ -2339,14 +2313,11 @@ async fn resolve(conn: &mut PgConnection, kb_id: Uuid) -> AppResult<Resolved> {
                     utopia_reason::rules::Conclusion::Attribute { value, .. } => {
                         (serde_json::json!({ "value": value }), value.clone())
                     }
-                    // 算出来的结论：值在命中里，**每个组合各一个**（0032）。
-                    // 求值器算不出数的组合根本不会产出命中，所以这里不会没有值
+                    // The evaluator has already rejected failed conversions.
+                    // Preserve its scalar type when this result feeds another rule.
                     utopia_reason::rules::Conclusion::Computed { .. } => {
-                        let Some(n) = h.value else { continue };
-                        let Some(v) = serde_json::Number::from_f64(n) else {
-                            continue;
-                        };
-                        let v = serde_json::Value::Number(v);
+                        let Some(ref result) = h.value else { continue };
+                        let v = result.to_json();
                         (serde_json::json!({ "value": v }), v)
                     }
                     // The relation arm above stores an entity edge and returns

@@ -1,6 +1,6 @@
 # 0036 · Exploration aligns a schema to the ontology
 
-- **Status**: In progress · decision 7 built (#561, #563) · open: #554, #555, #556
+- **Status**: In progress · conversion expressions (decision 3) and decision 7 built · open: #554, #556
 - **Written**: 2026-09-09 (conventions in the [README](README.md))
 - **Related**: [0011](0011-a-mapping-is-not-a-fact.md) moved a mapping out of the ledger and
   is right that it is configuration; this record moves the *concept* out of the entity table.
@@ -148,6 +148,51 @@ The natural-language column stays, as explanation: `summary` is what a reviewer 
 what the chat prompt quotes. The tree is the definition, the sentence is the description,
 and neither replaces the other.
 
+#### Conversion expressions (#555)
+
+The first conversion nodes are deliberately small: a cast to the existing finite
+floating-point number type, a simple `CASE` mapping scalar codes to scalar values,
+and truncation to a UTC calendar year, month or day. `CASE chnl WHEN 1 THEN 'app'
+ELSE 'other' END` translates a representation and belongs on the alignment. A
+named business grouping still belongs in a rule; using the same expression there
+does not make exploration its author. Case arms are literal numbers or text, not
+predicates or subqueries. This keeps each conversion's input readings and temporal
+premises explicit. A missing input, an unmatched case without `ELSE`, an invalid
+date or a failed numeric conversion produces no value, never a substitute zero.
+
+Numeric constants retain `const`, including the previously accepted numeric
+strings. Text literals use `text`, so admitting labels does not turn a misspelled
+numeric constant into a valid number. The additional shapes are:
+
+```json
+{"cast":"number","expr":{"attr":"<attribute UUID>"}}
+{"case":{"attr":"<attribute UUID>"},"when":[{"is":1,"then":"app"},{"is":2,"then":"web"}],"else":"other"}
+{"date_trunc":"month","expr":{"attr":"<attribute UUID>"}}
+```
+
+Case results have one scalar type, and at most 32 arms. The existing four-edge
+`MAX_EXPR_DEPTH` bound applies to every expression. Dates accept an ISO calendar
+date or an RFC 3339 timestamp with an offset; timestamp offsets are converted to
+UTC before truncation. The result is an ISO calendar date, such as `2024-02-01`.
+Naive timestamps, arbitrary cast types, decimal precision/scale, searched cases,
+aggregates and other SQL functions are outside this cut.
+
+Text is an input format only. The rule API can accept an expression as
+`{"expression":"CAST(amount AS DOUBLE PRECISION) / 100"}` wherever it accepts
+an expression tree. It resolves attribute **keys** in the current base and stores
+the resulting UUID tree; unresolved names and unsupported syntax fail before the
+rule is written. Ordinary scalar threshold strings keep their existing meaning.
+This gives the conversion tree an executable consumer before table alignments
+exist. Reading, validating and evaluating JSON share the same node definitions;
+rule results and their existing premise/interval machinery can carry text and
+calendar dates as well as numbers. A bare attribute expression retains its
+existing numeric interpretation. The read-only rule display follows the tree;
+the experimental picker is not enabled by this change.
+
+Table/column binding and adoption remain #554. Rendering the tree into each
+source dialect and retiring the old mapping classes remain #556. This cut does
+not reinterpret existing SQL mappings or decide the unit policy proposed in 0049.
+
 ### 4. A definition is a rule over aligned attributes, and a person writes it
 
 GMV is `sum(Order.paid_amount) where Order.is_valid`. It is not an entity and not a row in
@@ -205,9 +250,8 @@ the one decision here that is a bug fix and can land on its own.
 - **Matching a column to an existing attribute.** By name? By sampled values (#502)? By
   asking the model to say, with the attribute list in the prompt? The wide corpus, where
   `amt_pay` must land on `Order.paid_amount` and `buyer_lvl` on `Customer.tier`, is the test.
-- **What the tree needs beyond four operators**, and whether `case` over a code column is
-  a conversion (alignment) or a dimension (a rule that names groups). The wide corpus has
-  both readings of `chnl`.
+- **What another corpus needs beyond the conversion subset above.** A code-to-label
+  case is a conversion; a named business grouping is a rule that may reuse it.
 - **The page.** How a person reviews a table's alignment, edits one column's expression,
   and sees which rules a change reaches. Capability first, interface after, as usual.
 - **`derived`** on `concept_mappings` (0011 §1) was for "conversion rate = orders / visits".

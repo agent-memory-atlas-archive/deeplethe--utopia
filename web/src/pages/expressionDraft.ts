@@ -6,17 +6,20 @@ export type ExpressionDraft =
   | { const: string }
   | { op: "add" | "sub" | "mul" | "div"; l: ExpressionDraft; r: ExpressionDraft };
 
-export function draftFromExpression(expr: RuleExpression): ExpressionDraft {
+export function draftFromExpression(expr: RuleExpression): ExpressionDraft | null {
   if ("const" in expr) return { const: String(expr.const) };
   if ("attr" in expr) return { attr: expr.attr };
-  return { op: expr.op, l: draftFromExpression(expr.l), r: draftFromExpression(expr.r) };
+  // The experimental arithmetic picker must not flatten a conversion it cannot edit.
+  if (!("op" in expr)) return null;
+  const l = draftFromExpression(expr.l), r = draftFromExpression(expr.r);
+  return l && r ? { op: expr.op, l, r } : null;
 }
 
 /** Structural preview only. Declaration policy and server write validation are separate. */
-export function previewExpression(draft: ExpressionDraft, attributeIds: ReadonlySet<string>): RuleExpression | null {
+export function previewExpression(draft: ExpressionDraft | null, attributeIds: ReadonlySet<string>): RuleExpression | null {
   const parsed = readExpression(draft);
   if (!parsed) return null;
   const referencesExist = (node: RuleExpression): boolean =>
-    "attr" in node ? attributeIds.has(node.attr) : "const" in node || (referencesExist(node.l) && referencesExist(node.r));
+    "attr" in node ? attributeIds.has(node.attr) : "const" in node || ("op" in node && referencesExist(node.l) && referencesExist(node.r));
   return referencesExist(parsed) ? parsed : null;
 }

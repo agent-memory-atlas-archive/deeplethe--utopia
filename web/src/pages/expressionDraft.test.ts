@@ -12,7 +12,7 @@ describe("expression draft fidelity", () => {
       const expr = { op, l: { attr: a }, r: { op, l: { attr: b }, r: { attr: c } } };
       const draft = draftFromExpression(expr);
       expect(previewExpression(draft, ids)).toEqual(expr);
-      if (!("op" in draft) || !("op" in draft.r)) throw new Error("lost tree");
+      if (!draft || !("op" in draft) || !("op" in draft.r)) throw new Error("lost tree");
       const changed = { ...draft, r: { ...draft.r, r: { const: "2.5" } } };
       expect(previewExpression(changed, ids)).toEqual({ ...expr, r: { ...expr.r, r: { const: "2.5" } } });
       expect(draft).toEqual(expr);
@@ -32,5 +32,10 @@ describe("expression draft fidelity", () => {
     expect(previewExpression(draft, ids)).not.toBeNull();
     expect(previewExpression({ op: "add", l: draft, r: { attr: a } }, ids)).toBeNull();
     expect(readExpression({ attr: a, future: true })).toBeNull();
+  });
+  it("leaves conversion expressions out of the arithmetic-only draft editor", () => {
+    const conversion = { cast: "number" as const, expr: { attr: a } };
+    expect(draftFromExpression(conversion)).toBeNull();
+    expect(draftFromExpression({ op: "div", l: conversion, r: { const: 100 } })).toBeNull();
   });
 });

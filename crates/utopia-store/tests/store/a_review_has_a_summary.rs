@@ -18,6 +18,7 @@ struct Seed {
     kb: Uuid,
     org: Uuid,
     ada: Uuid,
+    facts: [Uuid; 3],
     conflict_at: DateTime<Utc>,
     review_at: DateTime<Utc>,
 }
@@ -138,6 +139,7 @@ async fn seed(pool: &PgPool) -> anyhow::Result<Seed> {
         kb,
         org,
         ada,
+        facts: [f1, f2, f3],
         conflict_at,
         review_at,
     })
@@ -154,6 +156,97 @@ async fn teardown(pool: &PgPool, s: &Seed) -> anyhow::Result<()> {
         .bind(s.org)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn shared_conflict_endpoints_do_not_multiply_health_counts() -> anyhow::Result<()> {
+    let Some(url) = utopia_store::test_db::url() else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&url).await?;
+    let s = seed(&pool).await?;
+    let other = seed(&pool).await?;
+    let run = async {
+        let [f1, f2, f3] = s.facts;
+        let (resolved_only, invalidated) = (Uuid::now_v7(), Uuid::now_v7());
+        for (id, confidence, retired) in [(resolved_only, 0.9f32, false), (invalidated, 0.5, true)]
+        {
+            sqlx::query(
+                "INSERT INTO facts (id, kb_id, subject_id, predicate_id, object_id,
+                                    confidence, invalidated_at)
+                 SELECT $1, kb_id, subject_id, predicate_id, object_id, $2,
+                        CASE WHEN $3 THEN now() END
+                   FROM facts WHERE id = $4",
+            )
+            .bind(id)
+            .bind(confidence)
+            .bind(retired)
+            .bind(f2)
+            .execute(&pool)
+            .await?;
+        }
+        // f1 occurs on both ends and in several open conflicts. Every health
+        // aggregate must still count the fact once, including low/unconfirmed.
+        for (old, new, status) in [
+            (f3, f1, "open"),
+            (f2, f1, "open"),
+            (resolved_only, f1, "resolved"),
+        ] {
+            sqlx::query(
+                "INSERT INTO fact_conflicts (id, kb_id, old_fact_id, new_fact_id, reason, status)
+                 VALUES ($1, $2, $3, $4, 'simultaneous', $5)",
+            )
+            .bind(Uuid::now_v7())
+            .bind(s.kb)
+            .bind(old)
+            .bind(new)
+            .bind(status)
+            .execute(&pool)
+            .await?;
+        }
+        let (doc, chunk) = (Uuid::now_v7(), Uuid::now_v7());
+        sqlx::query(
+            "INSERT INTO documents (id, kb_id, filename, sha256) VALUES ($1, $2, 'old.txt', $3)",
+        )
+        .bind(doc)
+        .bind(s.kb)
+        .bind(doc.to_string())
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO chunks (id, kb_id, document_id, seq, text, superseded_at)
+             VALUES ($1, $2, $3, 0, 'old evidence', now())",
+        )
+        .bind(chunk)
+        .bind(s.kb)
+        .bind(doc)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO fact_evidence (fact_id, chunk_id, document_id) VALUES ($1, $2, $3)",
+        )
+        .bind(f1)
+        .bind(chunk)
+        .bind(doc)
+        .execute(&pool)
+        .await?;
+        Ok::<_, anyhow::Error>(utopia_store::review_summary::summary(&pool, s.kb).await?)
+    }
+    .await;
+    teardown(&pool, &s).await?;
+    teardown(&pool, &other).await?;
+    let sum = run?;
+    assert_eq!(sum.health.facts, 4, "only this KB's live facts");
+    assert_eq!(
+        sum.health.contested, 3,
+        "distinct live endpoints of open conflicts"
+    );
+    assert_eq!(sum.health.low_confidence, 1);
+    assert_eq!(sum.health.unconfirmed, 1);
+    assert_eq!(sum.waiting.conflicts.count, 3);
+    assert_eq!(sum.waiting.lowconf.count, 1);
+    assert_eq!(sum.waiting.unconfirmed.count, 1);
     Ok(())
 }
 

@@ -8,3 +8,4 @@ license.workspace = true
 uuid.workspace = true
 # 属性值是字面值（`facts.object_value`），比较要认它的形状
 serde_json.workspace = true
+chrono.workspace = true

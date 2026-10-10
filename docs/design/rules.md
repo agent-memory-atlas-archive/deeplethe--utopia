@@ -34,8 +34,41 @@ attribute value, or a computed expression) and conditions `(attribute, op, opera
 `> >= < <= in not_in present`, grouped: conditions in a group join with and, groups with or, one
 level [0021, 0029, 0032]. A concluded typing is a derived attribute fact and never writes
 `entities.type_id` [0021 d2]. An operand or a conclusion may be an expression tree over attributes
-(`attr | const | add sub mul div`, depth capped), stored as JSONB, reachable through the API, the
-picker not built; a missing reading or a division by zero concludes nothing and is reported [0032].
+(`attr | const | text | add sub mul div`, numeric cast, scalar case and date truncation), stored as
+JSONB and reachable through the API. The depth cap is four edges from the root. A missing reading,
+division by zero or failed conversion concludes nothing [0032, 0036]; the experimental picker
+does not enable semantic edits of conversion expressions.
+
+**A conversion has a stored tree.** `{"cast":"number","expr":node}` converts to the existing
+finite floating-point number type. `{"case":node,"when":[{"is":1,"then":"app"}],"else":"other"}`
+maps codes to values; its one to 32 arms are scalar literals, its results all have the same type,
+and an unmatched code without `else` has no value. A missing selector has no value even with
+`else`. Case compares text and numeric codes separately; use an explicit cast to interpret a
+text code as a number. `{"date_trunc":"month","expr":node}` returns an ISO calendar date;
+`year`, `month` and `day` are supported. An ISO date is read as a calendar date; an RFC 3339
+timestamp is converted to UTC first, so `2024-03-01T00:30:00+08:00` truncates to `2024-02-01`.
+Naive timestamps and invalid dates have no value. These results use the same premise intersection,
+history, retirement and chaining as numeric computations. Numeric arithmetic remains floating
+point, not fixed-scale decimal accounting, and this does not introduce a unit-conversion policy.
+
+**Text is parsed before a write.** On `POST /api/v1/kbs/{id}/rules` and the corresponding rule
+`PATCH`, `conclude_expr` or a comparison condition's `operand` may instead contain
+`{"expression":"CAST(amount AS DOUBLE PRECISION) / 100"}`. Attribute **keys** resolve exactly
+within that base; quoted keys support spaces or non-Latin text. Only the resulting UUID tree is
+stored, including in definition versions. Ordinary numeric threshold strings remain scalar
+thresholds. Input is limited to 8192 bytes and the same tree depth bound. Supported text includes
+arithmetic, `CAST(... AS DOUBLE PRECISION)` (also `DOUBLE` or `::`), simple literal
+`CASE ... WHEN ... THEN ... [ELSE ...] END`, and `date_trunc('year'|'month'|'day', ...)`.
+Mixed or unknown JSON fields, unknown names, qualified paths, arbitrary functions, aggregates, subqueries, additional statements,
+cast precision/scale and function modifiers are refused. A rename or metadata-only patch keeps the
+existing definition. The rule page renders conversions read-only and includes their input
+attributes in the dependency view.
+
+The conversion regressions exercise these writes through authenticated routes and the real
+materializer: text and date results, chained conclusions, premise intervals, version changes,
+failed conversions and cross-base/viewer rejection. Table adoption and SQL rendering per source
+dialect remain [#554](https://github.com/deeplethe/utopia/issues/554) and
+[#556](https://github.com/deeplethe/utopia/issues/556); existing SQL mappings are unchanged.
 
 **Rules chain inside one run.** A round's conclusions rejoin the pool as readings and as derived
 class membership (entering as a premise so the interval narrows to when the entity was that class);
@@ -71,8 +104,8 @@ read it, so an invalidated conclusion still says what the rule said when it was 
   open-world [0029].
 - **A fixed point, not an ordering**, or whether `A → B → C` fires depends on load order; the DDL's
   objection protects "a run reads only asserted facts", which the in-memory fixed point keeps [0030].
-- **Picked, not typed**, because a picker cannot name an attribute that does not exist and a text
-  box grows a grammar; storing a string evaluated at run time is what is forbidden [0032].
+- **One stored expression tree.** A picker or the bounded text compiler resolves attribute IDs
+  before saving; storing a string evaluated at run time is forbidden [0032, 0036].
 - **Aggregation is refused** because a sum asserts a completeness the base cannot hold, its proof
   cannot explain its retirement, and it forecloses incremental maintenance [0032].
 - **Repairs, not rulings**: a contradiction is stale knowledge, a misread, a wrong merge or an

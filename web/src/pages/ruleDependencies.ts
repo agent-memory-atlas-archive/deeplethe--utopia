@@ -21,6 +21,14 @@ export function ruleDependencies(rules: Definition[], classes: Pick<EntityTypeVi
     const node = raw as Record<string, unknown>;
     if (typeof node.attr === "string") { index(readers, node.attr, id); return; }
     if (typeof node.const === "number" || typeof node.const === "string") return;
+    if (typeof node.text === "string") return;
+    if (node.cast === "number" || ["year", "month", "day"].includes(String(node.date_trunc))) {
+      readExpr(node.expr, id, depth + 1); return;
+    }
+    if ("case" in node && Array.isArray(node.when)) {
+      // Case arms are literals. Only the selector can read another rule's result.
+      readExpr(node.case, id, depth + 1); return;
+    }
     if (["add", "sub", "mul", "div"].includes(String(node.op))) {
       readExpr(node.l, id, depth + 1); readExpr(node.r, id, depth + 1);
     } else incomplete = true;

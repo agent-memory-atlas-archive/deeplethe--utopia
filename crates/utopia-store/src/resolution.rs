@@ -11,7 +11,7 @@
 use chrono::{DateTime, Utc};
 use pgvector::Vector;
 use sqlx::PgPool;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use utopia_core::models::{MergeLogView, ReviewBatchOutcome, ReviewItem, ReviewSide};
 use utopia_core::{AppError, AppResult};
 use uuid::Uuid;
@@ -316,6 +316,10 @@ async fn propose_by_name_vector(
             break; // 降序：后面的更远
         }
         if near.name.to_lowercase() == mention_name || !seen.insert(near.entity_id) {
+            continue;
+        }
+        // 只差一个数的名字向量上几乎重合，却几乎从不是同一个（见 `numbers_differ`）
+        if crate::names::numbers_differ(raw_name, &near.name) {
             continue;
         }
         let near_family = near
@@ -784,10 +788,13 @@ async fn containment_reviews(
         // 哪些类型对可能指同一个东西，既有规则已经想清楚了，别另发明一套：
         // 本体声明互斥的永不合并，person vs organization 永不合并，
         // concept 兜底与谁都可能是一个
-        .filter(|(_, _, type_key, other_type, _)| {
+        .filter(|(_, other_name, type_key, other_type, _)| {
             !other_type.is_some_and(|t| disjoint.contains(&t))
                 && classify_type_drift(mention_key.as_deref(), type_key.as_deref())
                     != TypeDrift::Disjoint
+                // `migration 39` 是 `migration 395` 的子串，但不是它的简称（见 `numbers_differ`）。
+                // 筛在 take 之前：带别的数的兄弟不该占掉真候选的名额
+                && !crate::names::numbers_differ(name, other_name)
         })
         .take(MAX_CONTAIN_REVIEWS)
         .map(|(id, other_name, _, _, emb)| {
@@ -1424,7 +1431,11 @@ pub(crate) struct ReviewRow {
     created_at: DateTime<Utc>,
 }
 
-async fn review_side(pool: &PgPool, kb_id: Uuid, entity_id: Uuid) -> AppResult<ReviewSide> {
+async fn review_sides(
+    pool: &PgPool,
+    kb_id: Uuid,
+    entity_ids: &[Uuid],
+) -> AppResult<HashMap<Uuid, ReviewSide>> {
     #[derive(sqlx::FromRow)]
     struct SideRow {
         id: Uuid,
@@ -1434,7 +1445,7 @@ async fn review_side(pool: &PgPool, kb_id: Uuid, entity_id: Uuid) -> AppResult<R
         disambiguator: Option<String>,
         degree: i64,
     }
-    let row: SideRow = sqlx::query_as(&format!(
+    let rows: Vec<SideRow> = sqlx::query_as(&format!(
         "SELECT e.id, e.canonical_name AS name, t.label AS type_label,
                 coalesce(t.color, '#94a3b8') AS color, e.disambiguator,
                 (SELECT count(*) FROM facts f
@@ -1443,24 +1454,31 @@ async fn review_side(pool: &PgPool, kb_id: Uuid, entity_id: Uuid) -> AppResult<R
          -- LEFT JOIN：没判出类型的实体照样要能进审核（0009）。
          -- 内连接会让它整条审核项取不出来，而漂移审核恰恰最常发生在它们身上
          FROM entities e LEFT JOIN entity_types t ON t.id = e.type_id
-         WHERE e.kb_id = $1 AND e.id = $2",
+         WHERE e.kb_id = $1 AND e.id = ANY($2)",
         not_name = crate::names::not_a_name("f"),
     ))
     .bind(kb_id)
-    .bind(entity_id)
-    .fetch_optional(pool)
-    .await?
-    .ok_or(AppError::NotFound)?;
-
-    Ok(ReviewSide {
-        id: row.id,
-        name: row.name,
-        type_label: row.type_label,
-        color: row.color,
-        disambiguator: row.disambiguator,
-        degree: row.degree,
-        top_facts: entity_fact_lines(pool, kb_id, entity_id, 4).await?,
-    })
+    .bind(entity_ids)
+    .fetch_all(pool)
+    .await?;
+    let mut lines = entity_fact_lines_many(pool, kb_id, entity_ids, 4).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.id,
+                ReviewSide {
+                    id: row.id,
+                    name: row.name,
+                    type_label: row.type_label,
+                    color: row.color,
+                    disambiguator: row.disambiguator,
+                    degree: row.degree,
+                    top_facts: lines.remove(&row.id).unwrap_or_default(),
+                },
+            )
+        })
+        .collect())
 }
 
 /// 实体的事实摘要行："works at → 星云科技 (2023-01 → now)"，裁决 prompt 与审核 UI 共用。
@@ -1470,8 +1488,26 @@ pub async fn entity_fact_lines(
     entity_id: Uuid,
     limit: i64,
 ) -> AppResult<Vec<String>> {
+    Ok(entity_fact_lines_many(pool, kb_id, &[entity_id], limit)
+        .await?
+        .remove(&entity_id)
+        .unwrap_or_default())
+}
+
+/// The lateral limit applies to each entity, not to the whole page. Keep this
+/// path shared with the single-entity reader used by adjudication.
+async fn entity_fact_lines_many(
+    pool: &PgPool,
+    kb_id: Uuid,
+    entity_ids: &[Uuid],
+    limit: i64,
+) -> AppResult<HashMap<Uuid, Vec<String>>> {
+    if entity_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
     #[derive(sqlx::FromRow)]
     struct Line {
+        entity_id: Uuid,
         direction: String,
         predicate_label: String,
         other_name: Option<String>,
@@ -1483,24 +1519,29 @@ pub async fn entity_fact_lines(
     // 开放陈述（0044）按它照抄的短语读：`phrase` 在关系标签之后、证据众数之前——
     // 类型化行的 phrase 是 NULL，它们的显示一字不变
     let rows: Vec<Line> = sqlx::query_as(&format!(
-        "SELECT CASE WHEN f.subject_id = $2 THEN 'out' ELSE 'in' END AS direction,
+        "SELECT requested.id AS entity_id, line.*
+         FROM unnest($2::uuid[]) AS requested(id)
+         CROSS JOIN LATERAL (
+         SELECT CASE WHEN f.subject_id = requested.id THEN 'out' ELSE 'in' END AS direction,
                 COALESCE(r.label, f.phrase, fact_surface_predicate(f.id)) AS predicate_label,
                 o.canonical_name AS other_name,
-                f.valid_from, f.valid_to
+                f.valid_from, f.valid_to, f.confidence, f.recorded_at
          FROM facts f
          LEFT JOIN relation_types r ON r.id = f.predicate_id
          LEFT JOIN entities o
-           ON o.id = CASE WHEN f.subject_id = $2 THEN f.object_id ELSE f.subject_id END
+           ON o.id = CASE WHEN f.subject_id = requested.id THEN f.object_id ELSE f.subject_id END
          WHERE f.kb_id = $1 AND f.invalidated_at IS NULL
-           AND (f.subject_id = $2 OR f.object_id = $2)
+           AND (f.subject_id = requested.id OR f.object_id = requested.id)
            AND COALESCE(r.label, f.phrase, fact_surface_predicate(f.id)) IS NOT NULL
            AND {not_name}
          ORDER BY f.confidence DESC, f.recorded_at DESC
-         LIMIT $3",
+         LIMIT $3
+         ) line
+         ORDER BY requested.id, line.confidence DESC, line.recorded_at DESC",
         not_name = crate::names::not_a_name("f"),
     ))
     .bind(kb_id)
-    .bind(entity_id)
+    .bind(entity_ids)
     .bind(limit)
     .fetch_all(pool)
     .await?;
@@ -1508,28 +1549,28 @@ pub async fn entity_fact_lines(
     // 本名以外的名字单独打头一行（0041）：「海洋探测器1号」对「海探1」，裁决器要看得见
     // 前者也叫海探1，否则两边的事实各说各的，它只会判「不是同一个」。本名不列——
     // 两个张伟各有一条「known as 张伟」，摆出来像共同证据，其实什么也分不出
-    let also_known_as = crate::names::other_names(pool, entity_id).await?;
-    let head =
-        (!also_known_as.is_empty()).then(|| format!("also known as: {}", also_known_as.join(", ")));
-
-    Ok(head
+    let names = crate::names::other_names_many(pool, entity_ids).await?;
+    let mut lines: HashMap<Uuid, Vec<String>> = names
         .into_iter()
-        .chain(rows.into_iter().map(|l| {
-            let other = l.other_name.unwrap_or_else(|| "?".into());
-            let core = if l.direction == "out" {
-                format!("{} → {}", l.predicate_label, other)
-            } else {
-                format!("{} ← {}", l.predicate_label, other)
-            };
-            match (l.valid_from, l.valid_to) {
-                (Some(f), Some(t)) => {
-                    format!("{core} ({} → {})", f.format("%Y-%m"), t.format("%Y-%m"))
-                }
-                (Some(f), None) => format!("{core} ({} → now)", f.format("%Y-%m")),
-                _ => core,
+        .map(|(id, names)| (id, vec![format!("also known as: {}", names.join(", "))]))
+        .collect();
+    for l in rows {
+        let other = l.other_name.unwrap_or_else(|| "?".into());
+        let core = if l.direction == "out" {
+            format!("{} → {}", l.predicate_label, other)
+        } else {
+            format!("{} ← {}", l.predicate_label, other)
+        };
+        let text = match (l.valid_from, l.valid_to) {
+            (Some(f), Some(t)) => {
+                format!("{core} ({} → {})", f.format("%Y-%m"), t.format("%Y-%m"))
             }
-        }))
-        .collect())
+            (Some(f), None) => format!("{core} ({} → now)", f.format("%Y-%m")),
+            _ => core,
+        };
+        lines.entry(l.entity_id).or_default().push(text);
+    }
+    Ok(lines)
 }
 
 pub(crate) async fn assemble_reviews(
@@ -1537,9 +1578,18 @@ pub(crate) async fn assemble_reviews(
     kb_id: Uuid,
     rows: Vec<ReviewRow>,
 ) -> AppResult<Vec<ReviewItem>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    // An entity can occur on either side of several pairs. Read it once for
+    // this page, then reuse its summary without changing the review order.
+    let mut entity_ids: Vec<Uuid> = rows.iter().flat_map(|r| [r.left_id, r.right_id]).collect();
+    entity_ids.sort_unstable();
+    entity_ids.dedup();
+    let sides = review_sides(pool, kb_id, &entity_ids).await?;
     // 这一页上开着的建议（0025）：一趟查完，按审核行挂上去
     let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
-    let proposals: Vec<(Uuid, utopia_core::models::ReviewProposal)> =
+    let proposals: HashMap<Uuid, utopia_core::models::ReviewProposal> =
         sqlx::query_as::<_, (Uuid, Uuid, String, f32, Option<String>)>(
             "SELECT target_id, id, action, confidence, reason FROM agent_decisions
          WHERE target_kind = 'review' AND target_id = ANY($1) AND status = 'proposed'",
@@ -1562,18 +1612,15 @@ pub(crate) async fn assemble_reviews(
         .collect();
     let mut items = Vec::with_capacity(rows.len());
     for r in rows {
-        let proposal = proposals
-            .iter()
-            .find(|(t, _)| *t == r.id)
-            .map(|(_, p)| p.clone());
+        let proposal = proposals.get(&r.id).cloned();
         items.push(ReviewItem {
             id: r.id,
             score: r.score,
             reason: r.reason,
             stage: r.stage,
             created_at: r.created_at,
-            left: review_side(pool, kb_id, r.left_id).await?,
-            right: review_side(pool, kb_id, r.right_id).await?,
+            left: sides.get(&r.left_id).cloned().ok_or(AppError::NotFound)?,
+            right: sides.get(&r.right_id).cloned().ok_or(AppError::NotFound)?,
             proposal,
         });
     }
@@ -2375,128 +2422,6 @@ pub async fn put_verdict(
     Ok(())
 }
 
-/// 记下模型提议、但本体装不下的类型。
-///
-/// **只写第一次**：同一实体会被多篇文档提到，第一次的提议就算它的提议；
-/// 后来的覆盖会让"哪些实体在等 model 类"随最后一篇文档抖动。
-/// 采纳了对应的类之后由改写流程清空——那时它已经不是"提议"而是既成事实。
-pub async fn set_proposed_type(pool: &PgPool, entity_id: Uuid, proposed: &str) -> AppResult<()> {
-    sqlx::query(
-        "UPDATE entities SET proposed_type = left($2, 60)
-         WHERE id = $1 AND proposed_type IS NULL",
-    )
-    .bind(entity_id)
-    .bind(proposed)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// 待认领的实体类型：模型提议过、本体没有、实体因此降级成了 concept。
-///
-/// 与谓词那边的 `graph::proposed_predicates` 对称——连着具体实体，所以采纳时
-/// 能说清"将重新归类 43 个"并真的去改，而不是只建一个空类。
-pub async fn proposed_types(
-    pool: &PgPool,
-    kb_id: Uuid,
-) -> AppResult<Vec<utopia_core::models::ProposedType>> {
-    Ok(sqlx::query_as(
-        "SELECT e.proposed_type AS form,
-                count(*) AS entity_count,
-                (array_agg(e.canonical_name ORDER BY e.created_at))[1] AS example
-         FROM entities e
-         WHERE e.kb_id = $1 AND e.merged_into IS NULL AND e.proposed_type IS NOT NULL
-           -- 用户拒绝过的类型不再出现在候选里
-           AND NOT EXISTS (SELECT 1 FROM ontology_misses m
-                           WHERE m.kb_id = $1 AND m.kind = 'entity_type'
-                             AND m.key = e.proposed_type AND m.dismissed_at IS NOT NULL)
-         GROUP BY e.proposed_type
-         ORDER BY entity_count DESC, form",
-    )
-    .bind(kb_id)
-    .fetch_all(pool)
-    .await?)
-}
-
-/// 把提议过 `forms` 里那些类型的实体改到 `type_id` 上。返回 (批次 id, 改动数)。
-///
-/// 与谓词那边的 `graph::adopt_proposed_predicates` 对称：**只建类型不动实体，
-/// 本体长大了、图没变好**——提议过 model 的实体会继续挂在 concept 下。
-///
-/// 实体是可变行（P0 的 PATCH 就直接改），所以这里就是 UPDATE，撤销靠账本
-/// 记下改之前的类型，而不是靠 supersedes 链。
-pub async fn adopt_proposed_types(
-    pool: &PgPool,
-    kb_id: Uuid,
-    type_id: Uuid,
-    forms: &[String],
-    // None = 引擎自动（本体长出新类之后的收尾认领没有人在按）
-    actor: Option<Uuid>,
-) -> AppResult<(Uuid, u32)> {
-    let batch_id = Uuid::now_v7();
-    if forms.is_empty() {
-        return Ok((batch_id, 0));
-    }
-    // 已经在目标类上的不算改动，也不进账本——撤销时不该把它们推回去。
-    //
-    // **`IS DISTINCT FROM` 而不是 `<>`**：0009 之后 type_id 可能是 NULL，而
-    // `NULL <> uuid` 求值为 NULL 不是 true，那一行会被悄悄滤掉——偏偏带着
-    // proposed_type 的几乎全是还没判出类型的实体，整个认领功能会一声不响地空转
-    let targets: Vec<(Uuid, Option<Uuid>, String)> = sqlx::query_as(
-        "SELECT id, type_id, canonical_name FROM entities
-         WHERE kb_id = $1 AND merged_into IS NULL
-           -- 人拍过板的不认领。**这一行顺带让 unadopt 天然正确**：human 行
-           -- 永远不进采纳批次，撤销时也就不会遇到它们，不必额外还原 type_source
-           AND type_source <> 'human'
-           AND proposed_type = ANY($2) AND type_id IS DISTINCT FROM $3",
-    )
-    .bind(kb_id)
-    .bind(forms)
-    .bind(type_id)
-    .fetch_all(pool)
-    .await?;
-
-    let mut names: HashSet<String> = HashSet::new();
-    let mut moved = 0u32;
-    for (entity_id, from_type, name) in targets {
-        let mut tx = pool.begin().await?;
-        sqlx::query(
-            // actor 有值 = 人在界面上点的批准，他背书了这个类型 → 受保护。
-            // 无值 = 本体长出新类之后的收尾认领，没人在按
-            "UPDATE entities
-                SET type_id = $2, proposed_type = NULL, updated_at = now(),
-                    type_source = CASE WHEN $3::uuid IS NULL THEN 'inferred' ELSE 'human' END
-             WHERE id = $1",
-        )
-        .bind(entity_id)
-        .bind(type_id)
-        .bind(actor)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "INSERT INTO entity_retypes
-                (batch_id, kb_id, entity_id, from_type_id, to_type_id, actor_id)
-             VALUES ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(batch_id)
-        .bind(kb_id)
-        .bind(entity_id)
-        .bind(from_type)
-        .bind(type_id)
-        .bind(actor)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        names.insert(name);
-        moved += 1;
-    }
-    // 消歧后缀的兜底值就是类型标签，改了类就得重算（同 P0 的实体改类）
-    for n in &names {
-        refresh_disambiguators(pool, kb_id, n).await?;
-    }
-    Ok((batch_id, moved))
-}
-
 /// 撤销一次实体改类：把它们放回原来的类型。
 ///
 /// 类型本身不删——与谓词那边同一条理由：有实体指向过它，而"它存在过"是历史。
@@ -2549,60 +2474,6 @@ pub async fn unadopt_types(pool: &PgPool, kb_id: Uuid, batch_id: Uuid) -> AppRes
     Ok(reverted)
 }
 
-/// 把提议的类型规整成 key 的形状：小写、非字母数字换下划线、压缩重复。
-/// "AI Model" → "ai_model"，与 validate_key 允许的字符集对齐。
-fn normalize_type_key(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut last_us = true; // 前导下划线也算重复
-    for c in s.trim().chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
-            last_us = false;
-        } else if !last_us {
-            out.push('_');
-            last_us = true;
-        }
-    }
-    while out.ends_with('_') {
-        out.pop();
-    }
-    out.chars().take(40).collect()
-}
-
-/// 认领那些"类型已经在本体里、实体却还挂在 concept 下"的实体。
-///
-/// `adopt_proposed_types` 只在**建类的那一刻**被调用，于是类先建好、实体后被
-/// 抽出来的情形就永远等不到搬运——而这恰恰是常态：本体第一轮建好，后续文档
-/// 继续产出提议。这个扫描把它们收尾。
-///
-/// 只做**规整后精确同名**的匹配，不做近似——猜错就是把实体放进错的类，
-/// 而"再等一轮"的代价接近零。
-pub async fn sweep_proposed_types(
-    pool: &PgPool,
-    kb_id: Uuid,
-    actor: Option<Uuid>,
-) -> AppResult<Vec<(Uuid, u32)>> {
-    let pending = proposed_types(pool, kb_id).await?;
-    let existing: Vec<(Uuid, String)> =
-        sqlx::query_as("SELECT id, key FROM entity_types WHERE kb_id = $1")
-            .bind(kb_id)
-            .fetch_all(pool)
-            .await?;
-    let mut out = Vec::new();
-    for p in &pending {
-        let norm = normalize_type_key(&p.form);
-        let Some((type_id, _)) = existing.iter().find(|(_, k)| *k == norm) else {
-            continue;
-        };
-        let (batch, n) =
-            adopt_proposed_types(pool, kb_id, *type_id, std::slice::from_ref(&p.form), actor)
-                .await?;
-        if n > 0 {
-            out.push((batch, n));
-        }
-    }
-    Ok(out)
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3026,9 +2897,7 @@ pub async fn nearest_typed_for_each_with(
 
 /// 按实体逐个改类，写进同一本账。返回 (批次 id, 改动数)。
 ///
-/// 与 [`adopt_proposed_types`] 的区别只在挑选方式：那个按 `proposed_type` 这个
-/// **说法**认领一批，这个由调用方点名——类型消解裁决出来的是"这个实体是那个类"，
-/// 不是"叫这个说法的都是那个类"。
+/// 由调用方点名：类型消解裁决出来的是"这个实体是那个类"，不是"叫这个说法的都是那个类"。
 ///
 /// 账本格式一字不差，所以 [`unadopt_types`] 原样能撤。
 pub async fn retype_entities(
