@@ -107,7 +107,9 @@ export function parseOperand(op: string, text: string): unknown | undefined {
     return set.length ? set : undefined;
   }
   if (kind === "range") {
-    const parts = t.split(/[-~]/).map((s) => Number(s.trim()));
+    const number = "[+-]?(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:[eE][+-]?\\d+)?";
+    const match = new RegExp(`^(${number})\\s*[-~]\\s*(${number})$`).exec(t);
+    const parts = match ? [Number(match[1]), Number(match[2])] : [];
     return parts.length === 2 && parts.every((n) => Number.isFinite(n))
       ? parts
       : undefined;
